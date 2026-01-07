@@ -43,7 +43,7 @@ def create_camera(cam_idx: int) -> Picamera2:
     """Create and configure a Picamera2 instance for given index."""
     picam = Picamera2(camera_num=cam_idx)
     config = picam.create_preview_configuration(
-        main={"size": (WIDTH, HEIGHT), "format": "RGB888"}
+        main={"size": (WIDTH, HEIGHT), "format": "BGR888"}
     )
     picam.configure(config)
     picam.start()
@@ -51,9 +51,8 @@ def create_camera(cam_idx: int) -> Picamera2:
     # Basic autofocus and sharpening (like in your original code)
     picam.set_controls(
         {
-            "AfMode": controls.AfModeEnum.Continuous,
-            "Sharpness": 1.5,
-            "Contrast": 1.1,
+            "AfMode": controls.AfModeEnum.Manual,
+            "LensPosition": 5.0,
         }
     )
 
