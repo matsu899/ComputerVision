@@ -3,6 +3,8 @@ VenvComputerVision/
 venv/
 env/
 ENV/
+.venv/
+.env/
 
 # Python
 __pycache__/
