@@ -8,25 +8,33 @@ from picamera2 import Picamera2
 from pyzbar.pyzbar import decode as zbar_decode
 from libcamera import controls
 
-# ---------- CAMERA CONFIG ----------
+# ---------- KONFIGURACE KAMERY ----------
 
-# Which cameras to use (Picamera2 indices)
-CAMERA_INDICES = [0, 1]  # 0 = first camera port, 1 = second
+# Které kamery použít (Picamera2 indexy)
+CAMERA_INDICES = [0, 1]  # 0 = první port kamery, 1 = druhý
 
-# Resolution
+# Rozlišení
 WIDTH, HEIGHT = 1920, 1080
 
-# Number of horizontal sections (slots) per camera
+# FPS limit
+TARGET_FPS = 5
+FRAME_TIME = 1.0 / TARGET_FPS
+
+# Časový limit pro považování slotu za prázdný
+LAST_SEEN_TIMEOUT = 2.0 
+slot_last_seen: Dict[str, float] = {}
+
+# Počet vodorovných sekcí (slotů) na kameru
 NUM_SECTIONS = 3
 
-# Decode performance tuning
+# Ladění výkonu dekódování
 DECODE_EVERY_N_FRAMES = 3
 
-# ROI (relative) – crop vertically so width remains full
-# (rx, ry, rw, rh) where values are 0..1 relative to full frame
+# ROI (relativní) – ořez v ose Y, šířka zůstane plná
+# (rx, ry, rw, rh) hodnoty 0..1 relativní k celému snímku
 ROI_REL = (0.0, 0.15, 1.0, 0.70)
 
-# Mapping (camera_index, section_index) -> logical slot name
+# Mapování (index_kamery, index_sekce) → logický název slotu
 SLOT_MAPPING: Dict[Tuple[int, int], str] = {
     (0, 0): "R1C1",
     (0, 1): "R1C2",
@@ -36,8 +44,7 @@ SLOT_MAPPING: Dict[Tuple[int, int], str] = {
     (1, 2): "R2C3",
 }
 
-# Mapping logical slot name -> organizer position in Django
-# Adjust these positions to match your OrganizerSlotState.position values.
+# Mapování logického názvu slotu → pozice organizéru v Django
 SLOT_TO_POSITION: Dict[str, int] = {
     "R1C1": 1,
     "R1C2": 2,
@@ -47,7 +54,7 @@ SLOT_TO_POSITION: Dict[str, int] = {
     "R2C3": 6,
 }
 
-# ---------- API CONFIG ----------
+# ---------- KONFIGURACE API ----------
 
 API_BASE = "http://192.168.137.1:8000/api"
 USERNAME = "Petr"
@@ -55,13 +62,11 @@ PASSWORD = "auto1111"
 
 ORGANIZER_ID = 1
 
-# How often to push the full detected state to the backend
+# Jak často synchronizovat stav do backendu
 SYNC_INTERVAL_SECONDS = 1.0
 
-# Request timeout
+# Časový limit požadavku
 API_TIMEOUT = 3
-
-# ----------------------------
 
 
 def get_auth() -> tuple[str, str]:
@@ -69,7 +74,7 @@ def get_auth() -> tuple[str, str]:
 
 
 def create_camera(cam_idx: int) -> Picamera2:
-    """Create and configure a Picamera2 instance for given index."""
+    """Vytvoří a nakonfiguruje instanci Picamera2 pro daný index."""
     picam = Picamera2(camera_num=cam_idx)
     config = picam.create_preview_configuration(
         main={"size": (WIDTH, HEIGHT), "format": "BGR888"}
@@ -77,7 +82,7 @@ def create_camera(cam_idx: int) -> Picamera2:
     picam.configure(config)
     picam.start()
 
-    # Adjust to what works best on your setup
+    # Nastavení manuálního ostření
     picam.set_controls(
         {
             "AfMode": controls.AfModeEnum.Manual,
@@ -85,12 +90,12 @@ def create_camera(cam_idx: int) -> Picamera2:
         }
     )
 
-    time.sleep(0.5)  # small warm-up
+    time.sleep(0.5) 
     return picam
 
 
 def find_bin_id_by_code(bin_code: str) -> Optional[int]:
-    """Resolve scanned BIN-... code to Bin.id in Django."""
+    """Převede skenovaný kód BIN-... na Bin.id v Django."""
     r = requests.get(
         f"{API_BASE}/bins/",
         params={"bin_code": bin_code},
@@ -115,8 +120,8 @@ def upsert_slot_state(
     is_empty: Optional[bool] = None,
 ) -> None:
     """
-    Create or update OrganizerSlotState for one organizer position.
-    Uses bin_id field because serializer maps bin_id -> model.bin.
+    Vytvoří nebo aktualizuje OrganizerSlotState pro jednu pozici organizéru.
+    Používá pole bin_id, protože serializer mapuje bin_id → model.bin.
     """
     r = requests.get(
         f"{API_BASE}/organizer-slot-states/",
@@ -162,8 +167,8 @@ def sync_slot_state_to_api(
     last_sent_state: Dict[str, Optional[str]],
 ) -> None:
     """
-    Push current slot_state to API.
-    Writes only slots whose value changed since last successful sync.
+    Odešle aktuální stav slotů do API.
+    Zapisuje pouze sloty, které se změnily od poslední synchronizace.
     """
     for slot_name in sorted(slot_state.keys()):
         current_code = slot_state[slot_name]
@@ -212,18 +217,18 @@ def sync_slot_state_to_api(
 
 
 def main():
-    # --- Init cameras ---
+    # Inicializace kamer
     cams: Dict[int, Picamera2] = {}
     for idx in CAMERA_INDICES:
         print(f"[INIT] Starting camera {idx}...")
         cams[idx] = create_camera(idx)
 
-    # Current frame state: slot_name -> scanned bin code or None
+    # Aktuální stav snímku: slot_name → kód skenu nebo None
     slot_state: Dict[str, Optional[str]] = {
         slot_name: None for slot_name in SLOT_MAPPING.values()
     }
 
-    # Last state successfully sent to API
+    # Poslední stav úspěšně odeslán do API
     last_sent_state: Dict[str, Optional[str]] = dict(slot_state)
 
     use_roi = True
@@ -236,22 +241,23 @@ def main():
     print("       Press 'r' in any window to toggle ROI.")
 
     while True:
+        loop_start = time.time()
         frame_count += 1
         t_now = time.time()
         fps = 1.0 / max(1e-6, (t_now - t_prev))
         t_prev = t_now
 
-        # Reset occupancy for this pass: assume all slots empty
+        # Vynulování – předpokládáme prázdné sloty
         for s in slot_state:
             slot_state[s] = None
 
-        # For each camera: grab frame, detect QRs, assign slots
+        # Pro každou kameru: ziska snímek, detekuje QR kódy a přiřadí sloty
         for cam_idx, picam in cams.items():
             frame_rgb = picam.capture_array()
             frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
             h, w = frame_bgr.shape[:2]
 
-            # Decide ROI
+            # Aplikace ROI
             if use_roi:
                 rx, ry, rw, rh = ROI_REL
                 x0 = int(rx * w)
@@ -265,7 +271,7 @@ def main():
                 y0 = 0
                 roi = frame_bgr
 
-            # Draw section borders on full frame
+            # Vykreslí hranice sekcí
             third = w // NUM_SECTIONS
             for s in range(1, NUM_SECTIONS):
                 x_line = s * third
@@ -300,6 +306,7 @@ def main():
 
                     if slot_name is not None:
                         slot_state[slot_name] = data
+                        slot_last_seen[slot_name] = time.time()
                         label = f"{slot_name}: {data}"
                     else:
                         label = f"cam{cam_idx} sec{section}: {data}"
@@ -334,17 +341,13 @@ def main():
             win_name = f"QR Live - Camera {cam_idx}"
             cv2.imshow(win_name, frame_bgr)
 
-        # Print per-frame summary
-        summary_parts = []
-        for slot_name in sorted(slot_state.keys()):
-            val = slot_state[slot_name]
-            if val is None:
-                summary_parts.append(f"{slot_name}: EMPTY")
-            else:
-                summary_parts.append(f"{slot_name}: {val}")
-        print(" | ".join(summary_parts))
+        now = time.time()
+        for slot_name in slot_state.keys():
+            last = slot_last_seen.get(slot_name, 0)
+            if now - last > LAST_SEEN_TIMEOUT:
+                slot_state[slot_name] = None
 
-        # Periodic API sync
+        # Periodická synchronizace API
         if time.time() - last_sync_time >= SYNC_INTERVAL_SECONDS:
             sync_slot_state_to_api(
                 organizer_id=ORGANIZER_ID,
@@ -352,6 +355,16 @@ def main():
                 last_sent_state=last_sent_state,
             )
             last_sync_time = time.time()
+        
+            # Souhrn jednotlivých snímků
+            summary_parts = []
+            for slot_name in sorted(slot_state.keys()):
+                val = slot_state[slot_name]
+                if val is None:
+                    summary_parts.append(f"{slot_name}: EMPTY")
+                else:
+                    summary_parts.append(f"{slot_name}: {val}")
+            print(" | ".join(summary_parts))
 
         key = cv2.waitKey(1) & 0xFF
         if key in (27, ord("q"), ord("Q")):
@@ -359,6 +372,18 @@ def main():
         elif key in (ord("r"), ord("R")):
             use_roi = not use_roi
             print(f"[INFO] ROI enabled: {use_roi}")
+
+        key = cv2.waitKey(1) & 0xFF
+        if key in (27, ord("q"), ord("Q")):
+            break
+        elif key in (ord("r"), ord("R")):
+            use_roi = not use_roi
+            print(f"[INFO] ROI enabled: {use_roi}")
+
+        elapsed = time.time() - loop_start
+        sleep_time = FRAME_TIME - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
     cv2.destroyAllWindows()
     for picam in cams.values():
